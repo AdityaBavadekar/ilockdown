@@ -1,26 +1,37 @@
 use anyhow::{Context, Result, anyhow};
-use nix::unistd::{Gid, Group, Uid, User, setgid, setuid};
-use std::fs::{create_dir_all, set_permissions, write};
+use colored::*;
+use nix::unistd::{Gid, Uid, User};
+use std::fs::{create_dir_all, set_permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
 
-const CF_URL: &str = "https://codeforces.com";
-const PROXY_HOST: &str = "127.0.0.1";
-const PROXY_PORT: u16 = 8080;
+use crate::config::{BROWSER_TARGETS_BASE_NAMES, BROWSER_TO_PATH, BROWSERS};
+use crate::config::{CF_URL, PROXY_HOST, PROXY_PORT};
+use crate::{focus};
 
-const BROWSERS: &[&str] = &[
-    "/usr/bin/brave",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome-stable",
-    "/usr/bin/google-chrome",
-    "/usr/bin/chromium",
-    "/usr/bin/microsoft-edge",
-    "/usr/bin/firefox",
-];
+pub fn launch_locked_browser(prefered_browser: Option<&str>) -> Result<Child> {
+    let binary = BROWSER_TO_PATH
+        .get(prefered_browser.unwrap_or_default())
+        .cloned()
+        .unwrap_or_default();
 
-pub fn launch_locked_browser() -> Result<Child> {
+    log::info!("Killing existing browser instances...");
+    focus::kill_all_matching(BROWSER_TARGETS_BASE_NAMES);
+
+    if !binary.is_empty() && Path::new(binary).exists() {
+        log::info!("Launching preferred kiosk browser: {}", binary);
+
+        let child = if binary.ends_with("firefox") {
+            launch_firefox(binary)?
+        } else {
+            launch_chromium(binary)?
+        };
+        log::info!("Browser started with PID {}", child.id());
+        return Ok(child);
+    }
+
     for bin in BROWSERS {
         if Path::new(bin).exists() {
             log::info!("Launching kiosk browser: {}", bin);
@@ -39,8 +50,71 @@ pub fn launch_locked_browser() -> Result<Child> {
     Err(anyhow!("No supported browser found"))
 }
 
+pub fn supervise_browser(mut child: Child) -> Result<()> {
+    match child.wait() {
+        Ok(status) => {
+            log::warn!("Browser exited with status: {}", status);
+        }
+        Err(e) => {
+            log::error!("Failed to wait for browser: {e}");
+        }
+    }
+    log::info!("Browser process ended!");
+    println!("Browser process ended!");
+    log::info!("Browser process ended — initiating lockdown release");
+
+    println!("\n\n\n");
+    println!(
+        "{}",
+        "══════════════════════════════════════════════════════════"
+            .bright_red()
+            .bold()
+    );
+
+    println!(
+        "{}",
+        "!!!  LOCKDOWN SESSION TERMINATED  !!!".bright_red().bold()
+    );
+
+    println!(
+        "{}",
+        "══════════════════════════════════════════════════════════"
+            .bright_red()
+            .bold()
+    );
+
+    println!();
+
+    println!("{}", format!("Browser process exited ").yellow().bold());
+
+    println!();
+    println!(
+        "{}",
+        "SYSTEM IS RELEASING LOCKDOWN NOW".bright_yellow().bold()
+    );
+
+    println!(
+        "{}",
+        "PLEASE DO NOT USE YOUR COMPUTER UNTIL CLEANUP IS COMPLETE"
+            .bright_green()
+            .bold()
+    );
+
+    println!();
+    println!(
+        "{}",
+        "══════════════════════════════════════════════════════════"
+            .bright_red()
+            .bold()
+    );
+
+    println!("\n");
+
+    Err(anyhow!("Browser process ended"))
+}
+
 fn resolve_desktop_user() -> Result<User> {
-    // 1. Strong source: sudo invocation user
+    // sudo invocation user
     if let Ok(name) = std::env::var("SUDO_USER") {
         if name != "root" {
             if let Some(user) = User::from_name(&name)? {
@@ -49,7 +123,7 @@ fn resolve_desktop_user() -> Result<User> {
         }
     }
 
-    // 2. Fallback: login shell user
+    // fallback: login shell user
     if let Ok(name) = std::env::var("USER") {
         if name != "root" {
             if let Some(user) = User::from_name(&name)? {
@@ -58,7 +132,7 @@ fn resolve_desktop_user() -> Result<User> {
         }
     }
 
-    // 3. Safety net: UID 1000 heuristic
+    // uid 1000 heuristic
     if let Some(user) = User::from_uid(nix::unistd::Uid::from_raw(1000))? {
         return Ok(user);
     }
@@ -83,7 +157,7 @@ fn launch_chromium(path: &str) -> Result<Child> {
         cur_gid.as_raw()
     );
 
-    //  create clean home just for this browser instance
+    //create home just for this browser instance
     let base_home = format!("/tmp/chrome-home-{}", user.uid.as_raw());
     let profile_dir = format!("{}/profile", base_home);
     let crashpad_dir = format!("{}/.config/google-chrome/Crashpad", base_home);
@@ -118,7 +192,9 @@ fn launch_chromium(path: &str) -> Result<Child> {
     }
 
     cmd.env("HOME", &base_home)
-        .env("CHROME_CRASHPAD_DISABLED", "1")
+        // .env("CHROME_CRASHPAD_DISABLED", "1")
+        .env("XDG_CONFIG_HOME", "/tmp/.chromium") // https://github.com/hardkoded/puppeteer-sharp/issues/2633
+        .env("XDG_CACHE_HOME", "/tmp/.chromium")
         .args([
             // "--kiosk",
             "--no-first-run",
@@ -131,10 +207,13 @@ fn launch_chromium(path: &str) -> Result<Child> {
             "--disable-sync",
             "--disable-gpu",
             "--disable-features=TranslateUI",
-            "--disable-crash-reporter",
-            "--disable-features=Crashpad",
-            // "--user-data-dir",
-            // &profile_dir,
+            // "--disable-crash-reporter",
+            // "--disable-features=Crashpad",
+            "--disable-breakpad",
+            "--crashpad-handler",
+            &format!("--database={}", crashpad_dir),
+            "--user-data-dir",
+            &profile_dir,
             &proxy_arg,
             "--app",
             CF_URL,
@@ -153,55 +232,19 @@ fn launch_firefox(path: &str) -> Result<Child> {
         user.gid.as_raw()
     );
 
-    // Always spawn Firefox via sudo -u to preserve DISPLAY + XAUTHORITY
     let mut cmd = Command::new("sudo");
 
     cmd.args([
         "-u",
-        &user.name, // <—— critical
+        &user.name,
         "--preserve-env=DISPLAY,XAUTHORITY,DBUS_SESSION_BUS_ADDRESS",
         path,
         "--private-window",
         CF_URL,
     ]);
-    cmd.spawn().context("Failed to launch Firefox via sudo")
-}
-
-fn launch_firefox2(path: &str) -> Result<Child> {
-    let profile_path = "/tmp/iicpc-firefox-profile";
-
-    create_dir_all(profile_path)?;
-
-    let prefs = format!(
-        r#"
-user_pref("browser.shell.checkDefaultBrowser", false);
-user_pref("browser.startup.homepage", "{}");
-user_pref("network.proxy.type", 1);
-user_pref("network.proxy.http", "{}");
-user_pref("network.proxy.http_port", {});
-user_pref("network.proxy.ssl", "{}");
-user_pref("network.proxy.ssl_port", {});
-"#,
-        CF_URL, PROXY_HOST, PROXY_PORT, PROXY_HOST, PROXY_PORT
-    );
-
-    write(format!("{}/user.js", profile_path), prefs)?;
-
-    let uid = Uid::current();
-    let gid = Gid::current();
-
-    Command::new(path)
-        .uid(uid.as_raw())
-        .gid(gid.as_raw())
-        .args([
-            "--profile",
-            profile_path,
-            "--no-remote",
-            "--kiosk",
-            "--private-window",
-            CF_URL,
-        ])
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
-        .context("Failed to launch Firefox")
+        .context("Failed to launch Firefox via sudo")
 }
-

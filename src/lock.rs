@@ -5,8 +5,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
-pub const LOCK_FILE: &str = "/run/iicpc-lockdown/init.lock";
-pub const RUNTIME_DIR: &str = "/run/iicpc-lockdown/";
+use crate::config::{LOCK_FILE, RUNTIME_DIR};
 
 pub struct InstanceLock {
     _file: std::fs::File,

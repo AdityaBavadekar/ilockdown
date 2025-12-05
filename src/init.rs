@@ -2,11 +2,8 @@ use anyhow::{Result, anyhow};
 use std::fs;
 use sysinfo::System;
 
-use crate::lock::InstanceLock;
+use crate::config::{LOG_DIR, RUNTIME_DIR};
 use crate::logger;
-
-const LOG_DIR: &str = "/var/log/iicpc-lockdown/";
-const RUNTIME_DIR: &str = "/run/iicpc-lockdown/";
 
 pub fn run() -> Result<()> {
     log::info!("initializing...");

@@ -1,27 +1,14 @@
-use crate::proxy::run_proxy;
+use crate::config::{NFT_BACKUP, NFT_LOCKDOWN_SCRIPT, NFT_SECOND_WRITE_ONCE_BACKUP, RUNTIME_DIR};
 use crate::watchdog::restore_blocked_services;
 use anyhow::{Context, Result, anyhow};
-use colored::*;
 use std::fs;
 use std::io::Write;
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::process::Stdio;
 use std::time::Duration;
-use tokio::runtime::Runtime;
 
-use crate::{
-    browser::launch_locked_browser,
-    lock::{self, RUNTIME_DIR},
-    watchdog::start_process_watchdog,
-};
-
-const NFT_BACKUP: &str = "/run/iicpc-lockdown/pre_lockdown.nft";
-const NFT_LOCKDOWN_SCRIPT: &str = "/run/iicpc-lockdown/lockdown.nft";
-const NFT_SECOND_WRITE_ONCE_BACKUP: &str = "/run/iicpc-lockdown/system_wo_backup.nft";
 pub fn apply_lockdown() -> Result<()> {
     // should be very critical section, should ensure that it does not backup the wrong state
     fs::create_dir_all(RUNTIME_DIR).context("Failed to create runtime dir for nft backup")?;
@@ -34,15 +21,7 @@ pub fn apply_lockdown() -> Result<()> {
     Ok(())
 }
 
-use std::process::Stdio;
 pub fn release_lockdown() -> Result<()> {
-    log::info!("Releasing lockdown...");
-
-    log::info!("Restoring cgroup...");
-    if let Err(e) = restore_cgroup() {
-        log::error!("Failed to restore cgroup: {}", e);
-    }
-
     log::info!("Restoring blocked services...");
     if let Err(e) = restore_blocked_services() {
         log::error!("Failed to restore blocked services: {}", e);
@@ -154,16 +133,16 @@ fn apply_lockdown_script() -> Result<()> {
     Ok(())
 }
 
-fn apply_network_lockdown() -> Result<()> {
+pub fn apply_network_lockdown() -> Result<()> {
     apply_lockdown()?;
     log::info!("Network lockdown ACTIVE and verified");
     Ok(())
 }
 
-const CHECK_BLOCKED_DOMAIN: &str = "google.com";
+const CHECK_BLOCKED_DOMAIN: &str = "8.8.8.8";
 const CHECK_REACHABLE_DOMAIN: &str = "codeforces.com";
 
-fn verify_connectivity(is_lockdowned: bool) -> Result<()> {
+pub fn verify_connectivity(is_lockdowned: bool) -> Result<()> {
     log::info!("Validating firewall behavior");
     let is_connecting_base = tcp_443_connect(CHECK_BLOCKED_DOMAIN);
 
@@ -217,215 +196,7 @@ fn tcp_443_connect(host: &str) -> bool {
     false
 }
 
-fn wait_for_proxy() {
-    for _ in 0..50 {
-        if TcpStream::connect("127.0.0.1:8080").is_ok() {
-            log::info!("Proxy is ready");
-            return;
-        }
-        log::info!("Waiting for proxy to start...");
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    panic!("Proxy did not start");
-}
-
-pub fn setup_cgroup(browser_pid: u32) -> Result<()> {
-    let cg = "/sys/fs/cgroup/iicpc";
-    fs::create_dir_all(cg)?;
-    fs::write(
-        "/sys/fs/cgroup/cgroup.subtree_control",
-        "+cpu +memory +pids",
-    )?;
-    fs::write(format!("{cg}/cgroup.procs"), browser_pid.to_string())?;
-    fs::write(format!("{cg}/memory.high"), "3G")?;
-    fs::write(format!("{cg}/memory.swap.max"), "0")?;
-    fs::write(format!("{cg}/pids.max"), "2048")?;
-
-    Ok(())
-}
-
-pub fn restore_cgroup() -> Result<()> {
-    let cg = "/sys/fs/cgroup/iicpc";
-
-    if !Path::new(cg).exists() {
-        return Ok(());
-    }
-
-    // Reset limits first (best practice)
-    let _ = fs::write(format!("{cg}/memory.high"), "max");
-    let _ = fs::write(format!("{cg}/memory.swap.max"), "max");
-    let _ = fs::write(format!("{cg}/pids.max"), "max");
-
-    // Remove the cgroup folder
-    fs::remove_dir(cg)?;
-
-    Ok(())
-}
-
-pub fn lockdown_daemon(lock_instance: &lock::InstanceLock) -> Result<()> {
-    let running = Arc::new(AtomicBool::new(true));
-    let flag = running.clone();
-    ctrlc::set_handler(move || {
-        flag.store(false, Ordering::SeqCst);
-    })
-    .expect("Error setting Ctrl+C handler");
-
-    // 0) acquire global instance lock
-    // validate lock_instance is held
-    if !lock::check_lockdown_active() {
-        return Err(anyhow::anyhow!(
-            "lock_instance is not active, cannot proceed with lockdown daemon"
-        ));
-    }
-
-    log::info!("Lock instance verified, proceeding with lockdown daemon");
-    log::info!("Starting lockdown daemon...");
-
-    // 1) pre-flight checks
-    log::info!("Performing pre-flight checks...");
-    log::info!("[PASS] pre-flight checks passed");
-
-    // 2) take baseline snapshot (for logs & later comparisons)
-    //    - capture list of network interfaces (ip link)
-    //    - capture current monitors / display topology (xrandr / wayland)
-    //    - capture baseline process list (/proc/*/cmdline)
-    //    - capture usb devices (lsusb / /sys/bus/usb)
-    //    - save to ~/.iicpc-lockdown/logs/baseline-*.txt
-
-    // 3) apply network lockdown
-    if let Err(e) = apply_network_lockdown() {
-        log::error!("Network lockdown failed: {}, releasing lockdown...", e);
-        eprintln!("{}", format!("Network lockdown failed: {}", e).red().bold());
-        let _ = release_lockdown();
-        log::error!("Lockdown daemon aborted due to network lockdown failure");
-        return Err(anyhow!("Network lockdown failed: {}", e));
-    }
-
-    // apply hosts blocklist
-    if let Err(e) = apply_hosts_blocklist() {
-        log::error!(
-            "Failed to apply hosts blocklist: {}, releasing lockdown...",
-            e
-        );
-        eprintln!(
-            "{}",
-            format!("Failed to apply hosts blocklist: {}", e)
-                .red()
-                .bold()
-        );
-        let _ = release_lockdown();
-        log::error!("Lockdown daemon aborted due to hosts blocklist failure");
-        return Err(anyhow!("Failed to apply hosts blocklist: {}", e));
-    }
-
-    verify_connectivity(true)?;
-
-    // 4) Enter restricted namespaces / cgroup
-    //    - unshare NEWPID / NEWNET / NEWNS / NEWCGROUP / NEWIPC
-    //    - Create cgroup v2 "iicpc-lockdown":
-    //        * Limit pids.max (prevent mass process spawns)
-    //        * Deny /dev/nvidia*, /dev/dri for GPU LLMs
-    //    - Move browser + our daemon into this cgroup
-    //    - Ensure no other user processes are in this sandbox
-
-    log::info!("Starting proxy server for browser...");
-    // create async runtime for proxy
-    let rt = Runtime::new().context("Failed to create tokio runtime")?;
-
-    // spawn proxy in background thread
-    std::thread::spawn(move || {
-        if let Err(e) = rt.block_on(run_proxy()) {
-            log::error!("Proxy exited with error: {}", e);
-        }
-    });
-    log::info!("Proxy server started, waiting for readiness...");
-
-    wait_for_proxy();
-
-    // 5) launch locked browser session
-    let browser = launch_locked_browser().context("Failed to launch locked browser session")?;
-    log::info!("Locked browser launched with PID {}", browser.id());
-    let BROWSER_PID: u32 = browser.id();
-
-    setup_cgroup(browser.id()).context("Failed to setup cgroup for browser")?;
-
-    // 6) start watchdog tasks
-    log::info!("Starting process watchdog...");
-    start_process_watchdog(BROWSER_PID);
-
-    // network watchdog
-    let r2 = running.clone();
-    thread::spawn(move || {
-        while r2.load(Ordering::SeqCst) {
-            watchdog_network();
-            thread::sleep(Duration::from_secs(5));
-        }
-    });
-
-    //    6.2) Network / interface watchdog (every 3–5s)
-    //        - Check for new interfaces: tun*, tap*, wg*, usb*
-    //        - Detect active VPN processes (openvpn, wireguard, tailscale, warp)
-    //        - On detection:
-    //            * Log violation
-    //            * Optionally kill browser + mark attempt
-
-    //    6.3) VM / remote-access watchdog (every 10–15s)
-    //        - Re-check:
-    //            * systemd-detect-virt
-    //            * Processes: teamviewer, anydesk, rustdesk, chrome-remote-desktop, sunshine, etc.
-    //        - On detection: log + optionally mark system as “untrusted environment”
-
-    //    6.4) Focus / UI watchdog (short interval, 500–1000ms, X11-only MVP)
-    //        - Query current active window
-    //        - If focus is not on the lockdown browser:
-    //            * Log FOCUS_LOST
-    //            * Optionally bring browser back to foreground
-
-    //    6.5) USB / hardware watchdog (event-based or polling)
-    //        - Listen to udev events or poll /sys/bus/usb/devices
-    //        - Detect new HID devices, HDMI display plug-in
-    //        - On detection: log + optional immediate alert
-
-    // 7) Main daemon loop
-    //    - Sleep in a simple loop (e.g., 1s) just to keep main thread alive
-    //    - Optionally aggregate stats from watchdogs:
-    //        * # of violations
-    //        * last violation time
-    //        * system resource usage
-    //    - Continue until:
-    //        * Ctrl+C
-    //        * “unlock” command (future: IPC/message / signal)
-
-    // 8) Shutdown / unlock sequence (called by separate `unlock` command or on exit)
-    //    - Kill/close lockdown browser
-    //    - Stop watchdog threads cleanly (set a shutdown flag / join threads)
-    //    - Restore nftables rules from backup
-    //    - Tear down cgroup v2 for iicpc-lockdown
-    //    - Remove /run/iicpc-lockdown/* temp files
-
-    log::info!("Lockdown applied successfully, current status: ACTIVE");
-    println!(
-        "{}",
-        "Lockdown applied successfully, current status: ACTIVE"
-            .green()
-            .bold()
-    );
-
-    while running.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_secs(5));
-    }
-
-    log::info!("Lockdown daemon shutting down...");
-    println!("Lockdown daemon shutting down...");
-
-    log::info!("Lockdown daemon exiting — cleaning up...");
-    release_lockdown()?;
-
-    Ok(())
-}
-
-fn watchdog_network() {
+pub fn watchdog_network() {
     if let Ok(output) = Command::new("ip").args(["link", "show"]).output() {
         let links = String::from_utf8_lossy(&output.stdout);
 

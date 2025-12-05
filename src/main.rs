@@ -1,20 +1,28 @@
 use anyhow::Context;
-use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use nix::unistd::Uid;
+use std::{
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::Duration,
+};
 use tokio::runtime::Runtime;
 
 use crate::watchdog::start_process_watchdog;
 use crate::{
-    firewall::{apply_lockdown, lockdown_daemon, release_lockdown},
     lock::InstanceLock,
+    lockdown::{lockdown_daemon, release_lockdown},
     proxy::run_proxy,
 };
+mod audio;
 mod browser;
+mod config;
 mod firewall;
 mod focus;
 mod init;
 mod lock;
+mod lockdown;
 mod logger;
 mod proxy;
 mod watchdog;
@@ -70,9 +78,13 @@ enum Commands {
 
     // Focus monitoring test
     FocusMonitor,
+
+    // Audio test
+    AudioTest,
 }
 
-// make sure the program is run as root
+const DEFAULT_PREFERED_BROWSER: Option<&str> = None;
+
 fn require_root() {
     if !Uid::effective().is_root() {
         eprintln!("[!] This tool requires root privileges.");
@@ -97,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Init => {
             println!("Initialization complete.");
+            focus::init_monitor();
         }
         Commands::Status => {
             if !lock::check_lockdown_active() {
@@ -107,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Start => {
             let _lock = InstanceLock::acquire()?;
-            lockdown_daemon(&_lock)?;
+            lockdown_daemon(DEFAULT_PREFERED_BROWSER)?;
         }
         Commands::Unlock => {
             let _lock = InstanceLock::acquire()?;
@@ -120,14 +133,14 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::FocusMonitor => {
             log::info!("Focus monitoring test running...");
-            focus::start_focus_monitor().await;
+            // focus::start_focus_monitor().await;
+            let allowed_pids: Option<Vec<u32>> = Some(vec![std::process::id()]);
+            focus::main(&allowed_pids);
         }
         Commands::BrowserTest => {
-            browser::launch_locked_browser()?;
-            // keep the main thread alive while the browser is running
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-            }
+            let instance = browser::launch_locked_browser(DEFAULT_PREFERED_BROWSER)?;
+            // keep the main thread alive
+            browser::supervise_browser(instance)?;
         }
         Commands::RestrictAppsTest => {
             log::info!("RestrictApps test running...");
@@ -136,11 +149,27 @@ async fn main() -> anyhow::Result<()> {
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
         }
-        Commands::ProxyTest => {
-            // create async runtime for proxy
-            let rt = Runtime::new().context("Failed to create tokio runtime")?;
+        Commands::AudioTest => {
+            log::info!("Audio test starting...");
+            audio::start_lockdown();
+            let running = Arc::new(AtomicBool::new(true));
+            let r = running.clone();
+            ctrlc::set_handler(move || {
+                r.store(false, Ordering::SeqCst);
+            })
+            .unwrap();
 
-            // spawn proxy in background thread
+            while running.load(Ordering::SeqCst) {
+                log::info!("Audio lockdown tick...");
+                audio::lockdown_tick();
+                thread::sleep(Duration::from_millis(1000));
+            }
+
+            audio::end_lockdown();
+            log::info!("Audio test ended.");
+        }
+        Commands::ProxyTest => {
+            let rt = Runtime::new().context("Failed to create tokio runtime")?;
             std::thread::spawn(move || {
                 if let Err(e) = rt.block_on(run_proxy()) {
                     log::error!("Proxy exited with error: {}", e);

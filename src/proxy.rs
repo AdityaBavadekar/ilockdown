@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tokio::io::copy_bidirectional;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -15,8 +15,6 @@ pub async fn run_proxy() -> Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         log::info!("Incoming proxy connection from {}", addr);
-
-        // move ownership into the task so we can safely split/use it
         tokio::spawn(async move {
             if let Err(e) = handle_client(stream).await {
                 log::warn!("Proxy client error: {:?}", e);
@@ -53,7 +51,6 @@ async fn handle_client(mut inbound: TcpStream) -> Result<()> {
         return Ok(());
     }
 
-    // target: "host:port"
     let mut hp = target.split(':');
     let host = hp.next().unwrap_or("").to_string();
     let port = hp.next().unwrap_or("443").to_string();
@@ -77,17 +74,15 @@ async fn handle_client(mut inbound: TcpStream) -> Result<()> {
         .await
         .context("Failed to connect to remote")?;
 
-    // small latency improvement
+    // latency improvement
     inbound.set_nodelay(true).ok();
     outbound.set_nodelay(true).ok();
 
-    // send 200 Connection established
     inbound
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await
         .context("Failed to write 200 response")?;
 
-    // full-duplex copy; efficient and handles half-closes correctly
     let _ = copy_bidirectional(&mut inbound, &mut outbound)
         .await
         .context("copy_bidirectional failed")?;
@@ -97,8 +92,6 @@ async fn handle_client(mut inbound: TcpStream) -> Result<()> {
 
 fn is_allowed_host(host: &str) -> bool {
     let h = host.to_ascii_lowercase();
-
-    // exact and wildcard codeforces + critical cloudflare challenge domains if needed
     let allowed_exact = [
         // [CORE]
         "codeforces.com",
@@ -121,6 +114,9 @@ fn is_allowed_host(host: &str) -> bool {
         // [RENDERING] MathJax & External Libs
         "cdnjs.cloudflare.com",
         "cdn.jsdelivr.net",
+        // [CLOUDFLARE CHALLENGE]
+        "challenges.cloudflare.com",
+        "static.cloudflareinsights.com",
     ];
 
     if allowed_exact.contains(&h.as_str()) {
@@ -129,11 +125,6 @@ fn is_allowed_host(host: &str) -> bool {
 
     // wildcard *.codeforces.com
     if h.ends_with(".codeforces.com") {
-        return true;
-    }
-
-    // Cloudflare challenge if needed
-    if h == "challenges.cloudflare.com" || h == "static.cloudflareinsights.com" {
         return true;
     }
 

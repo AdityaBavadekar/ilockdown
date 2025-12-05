@@ -1,18 +1,20 @@
 use anyhow::{Context, Result};
 use chrono::Local;
-use chrono::Utc;
 use colored::*;
 use libc::{SIGKILL, kill};
-use nix::sys::signal::Signal;
-use nix::unistd::Pid;
 use nix::unistd::Uid;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use std::{fs, process::Command, thread, time::Duration};
-use sysinfo::System;
+use std::{fs, process::Command, thread};
 use uuid::Uuid;
+
+use crate::config::{
+    BLACKLIST, BLOCK_CODE_EDITORS, BLOCK_INTERPRETERS_AND_COMPILERS, CODE_EDITORS,
+    INTERPRETERS_AND_COMPILERS, SCAN_INTERVAL, TEST_MODE,
+};
+use crate::focus;
 
 #[derive(Serialize)]
 struct ScanFinding {
@@ -34,256 +36,18 @@ struct ScanReport {
     pub findings: Vec<ScanFinding>,
 }
 
-const TEST_MODE: bool = false;
-const BLOCK_CODE_EDITORS: bool = true;
-const BLOCK_INTERPRETERS_AND_COMPILERS: bool = true;
-const BLACKLIST: &[&str] = &[
-    // [SECTION: LOCAL LLMS & AI RUNTIMES]
-    "ollama",
-    "lm-studio",
-    "gpt4all",
-    "llama",
-    "koboldcpp",
-    "koboldai",
-    "oobabooga",
-    "text-generation",
-    "localai",
-    "jan-app",
-    "llama",
-    "gpt4all",
-    "lmstudio",
-    "textgen",
-    "rwkv",
-    "mistral",
-    "huggingface",
-    "langchain",
-    "privategpt",
-    "copilot",
-    "whisper",
-    // [SECTION: REMOTE DESKTOP & SCREEN SHARING]
-    "teamviewer",
-    "anydesk",
-    "rustdesk",
-    "chrome-remote",
-    "remotedesktop",
-    "mstsc",
-    "vnc",
-    "nomachine",
-    "logmein",
-    "parsec",
-    "sunshine",
-    "moonlight",
-    "splashtop",
-    "screenconnect",
-    "ammyy",
-    "supremo",
-    // [SECTION: COMMUNICATION & COLLABORATION]
-    "discord",
-    "slack",
-    "skype",
-    "telegram",
-    "whatsapp",
-    "signal",
-    "viber",
-    "teams",
-    "zoom",
-    "webex",
-    "gotomeeting",
-    "element",
-    "mattermost",
-    // [SECTION: WEB BROWSERS]
-    "chrome",
-    "firefox",
-    "brave",
-    "opera",
-    "edge",
-    "msedge",
-    "chromium",
-    "vivaldi",
-    "tor",
-    "tor-browser",
-    "librewolf",
-    "waterfox",
-    "safari",
-    "yandex",
-    "epiphany",
-    "konqueror",
-    // [SECTION: VIRTUALIZATION & SANDBOXING]
-    "qemu",
-    "virtualbox",
-    "vbox",
-    "vmware",
-    "vmwp",
-    "xen",
-    "dosbox",
-    "sandboxie",
-    "wsl",
-    "docker",
-    "podman",
-    "bluestacks",
-    "nox",
-    "ldplayer",
-    // [SECTION: NETWORK TUNNELING & PROXIES]
-    "ngrok",
-    "cloudflared",
-    "localtunnel",
-    "frp",
-    "chisel",
-    "proxifier",
-    "charles",
-    "fiddler",
-    "wireshark",
-    "nmap",
-    // [SECTION: CHEAT ENGINES & PROCESS HACKERS]
-    "cheatengine",
-    "processhacker",
-    "procexp",
-    "ida",
-    "ghidra",
-    "x64dbg",
-    "ollydbg",
-    // [SECTION: TERMINALS & SHELLS]
-    // "bash",
-    // "sh",
-    // "zsh",
-    "fish",
-    "dash",
-    "ksh",
-    "tcsh",
-    "csh",
-    // Surrogates / shell runners
-    "busybox",
-    "env",
-    "setsid",
-    "script",
-    "expect",
-    "tmux",
-    "screen",
-    "byobu",
-    // Common terminal emulators
-    "gnome-terminal",
-    "gnome-terminal-server",
-    "konsole",
-    "xfce4-terminal",
-    "mate-terminal",
-    "lxterminal",
-    "qterminal",
-    "tilix",
-    "terminator",
-    "alacritty",
-    // "kitty",
-    "wezterm",
-    "hyper",
-    "tabby",
-    "rio",
-    "cool-retro-term",
-    "guake",
-    "yakuake",
-    "tilda",
-    "eterm",
-    "xterm",
-    "rxvt",
-    "urxvt",
-    "aterm",
-    "st",
-    "sakura",
-    "foot",
-    "iterm",
-    "mintty",
-    // Multiplexers & remote shells
-    "ssh",
-    "scp",
-    "sftp",
-    "mosh",
-    "",
-];
-
-const CODE_EDITORS: &[&str] = &[
-    "code",
-    "code-oss",
-    "vscode",
-    "sublime_text",
-    "atom",
-    "notepadqq",
-    "gedit",
-    "kate",
-    "vim",
-    "emacs",
-];
-
-const INTERPRETERS_AND_COMPILERS: &[&str] = &[
-    "gcc",
-    "g++",
-    "clang",
-    "clang++",
-    "javac",
-    "java",
-    // "rustc",
-    // "cargo",
-    "go",
-    "python",
-    "node",
-    "ipython",
-    "jupyter",
-    "anaconda",
-    "miniconda",
-    "npm",
-    "pip",
-];
-
-const SCAN_INTERVAL: Duration = Duration::from_secs(10);
-
 pub fn start_process_watchdog(browser_pid: u32) {
+    let allowed_pids: Option<Vec<u32>> = Some(vec![browser_pid, std::process::id()]);
+
     thread::spawn(move || {
         log::info!("Process watchdog started");
+        focus::main(&allowed_pids);
 
-        loop {
-            if let Err(e) = scan_and_enforce(browser_pid) {
-                log::error!("Watchdog error: {}", e);
-            }
-            thread::sleep(SCAN_INTERVAL);
-        }
+        // loop {
+        //     focus::main(&allowed_pids);
+        //     thread::sleep(SCAN_INTERVAL);
+        // }
     });
-}
-
-fn scan_and_enforce(browser_pid: u32) -> Result<()> {
-    let mut count = 0;
-    let self_pid = std::process::id();
-    iter_processes(Some(&mut |proc_info: &ProcInfo| {
-        if browser_pid != proc_info.pid && proc_info.pid != self_pid {
-            count += 1;
-            if let Some(service) = get_service_for_pid(proc_info.pid) {
-                log::warn!(
-                    "Process PID {} is managed by systemd service: {}",
-                    proc_info.pid,
-                    service
-                );
-                disable_and_record_service(&service);
-                log::warn!("Disabled systemd service: {}", service);
-            }
-            if let Err(e) = handle_violation(
-                proc_info.pid,
-                &proc_info.binary,
-                &proc_info.clean_cmdline,
-                browser_pid,
-            ) {
-                log::error!("Error handling violation for PID {}: {}", proc_info.pid, e);
-            }
-        }
-    }));
-    if count > 0 {
-        if TEST_MODE {
-            println!(
-                "{} Flagged {} forbidden processes (TEST MODE - no action taken)",
-                "[WARNING]".yellow().bold(),
-                count
-            );
-        }
-        println!("==> Total flagged processes: {}", count);
-    } else {
-        log::info!("No flagged processes running!")
-    }
-    Ok(())
 }
 
 pub fn scan_only(kill_on_detect: bool) -> Result<()> {
@@ -316,7 +80,7 @@ pub fn scan_only(kill_on_detect: bool) -> Result<()> {
                     proc_info.pid,
                     service
                 );
-                disable_and_record_service(&service);
+                let _ = disable_and_record_service(&service);
                 log::warn!("Disabled systemd service: {}", service);
             }
             handle_violation(
@@ -348,7 +112,6 @@ struct ProcInfo {
     pid: u32,
     binary: String,
     args: Vec<String>,
-    realpath: Option<String>,
     clean_cmdline: String,
 }
 
@@ -393,14 +156,11 @@ fn iter_processes(mut on_match: Option<&mut dyn FnMut(&ProcInfo)>) -> Result<Vec
             .unwrap_or("")
             .to_lowercase();
 
-        let realpath = get_real_exe_path(pid);
-
-        // run blacklist matching
+        // let realpath = get_real_exe_path(pid);
         let proc_info = ProcInfo {
             pid,
             binary,
             args: parts[1..].to_vec(),
-            realpath,
             clean_cmdline: parts.join(" "),
         };
 
@@ -427,7 +187,7 @@ fn kill_tree(root_pid: u32) -> std::io::Result<()> {
     }
 }
 
-fn get_service_for_pid(pid: u32) -> Option<String> {
+pub fn get_service_for_pid(pid: u32) -> Option<String> {
     let cgroup_path = format!("/proc/{}/cgroup", pid);
     let data = std::fs::read_to_string(cgroup_path).ok()?;
 
@@ -441,13 +201,6 @@ fn get_service_for_pid(pid: u32) -> Option<String> {
     }
 
     None
-}
-
-fn get_real_exe_path(pid: u32) -> Option<String> {
-    let link = format!("/proc/{}/exe", pid);
-    std::fs::read_link(link)
-        .ok()
-        .map(|p| p.to_string_lossy().to_string())
 }
 
 fn match_blacklist(proc: &ProcInfo) -> Option<String> {
@@ -469,15 +222,6 @@ fn match_blacklist(proc: &ProcInfo) -> Option<String> {
         //     return Some(rule);
         // }
     }
-
-    // if !is_allowed(proc) {
-    //     println!(
-    //         "Flagged unrecognized process: BINARY: {}, PATH: {:?}, CMD: {}",
-    //         proc.binary,
-    //         proc.realpath,
-    //         proc.clean_cmdline
-    //     );
-    // }
 
     if BLOCK_CODE_EDITORS {
         for editor in CODE_EDITORS {
@@ -516,20 +260,41 @@ fn match_blacklist(proc: &ProcInfo) -> Option<String> {
 
 const BLOCKED_SERVICES_FILE: &str = "/var/lib/iicpc/blocked_services.json";
 
-fn disable_and_record_service(service: &str) -> Result<()> {
+pub fn disable_and_record_service(service: &str) -> Result<()> {
+    const ALLOWED_SERVICES: &[&str] = &[
+        "systemd-journald.service",
+        "systemd-logind.service",
+        "dbus.service",
+        "sshd.service",
+        "networking.service",
+        "NetworkManager.service",
+        "cron.service",
+        "rsyslog.service",
+        "firefox",
+        "chromium",
+        "google-chrome",
+        "brave-browser",
+        "microsoft-edge",
+    ];
+
+    if ALLOWED_SERVICES.contains(&service) {
+        log::info!("Service {} is in allowed list, skipping disable.", service);
+        return Ok(());
+    }
+
     log::info!("Blocking service: {}", service);
 
-    // -- stop service
+    // stop service
     std::process::Command::new("systemctl")
         .args(["stop", service])
         .status()?;
 
-    // -- mask service (hard block)
+    // mask service
     std::process::Command::new("systemctl")
         .args(["mask", service])
         .status()?;
 
-    // -- load or create journal
+    // load or create journal
     let mut journal = if Path::new(BLOCKED_SERVICES_FILE).exists() {
         let raw = fs::read_to_string(BLOCKED_SERVICES_FILE)?;
         serde_json::from_str::<BlockedServices>(&raw)?
@@ -540,12 +305,12 @@ fn disable_and_record_service(service: &str) -> Result<()> {
         }
     };
 
-    // -- avoid duplicates
+    // avoid duplicates
     if !journal.services.contains(&service.to_string()) {
         journal.services.push(service.to_string());
     }
 
-    // -- save journal
+    // save journal
     fs::create_dir_all("/var/lib/iicpc")?;
     fs::write(
         BLOCKED_SERVICES_FILE,
@@ -624,6 +389,8 @@ fn handle_violation(pid: u32, binary: &str, cmdline: &str, browser_pid: u32) -> 
         // std::process::exit(1);
     }
 
+    let _ = kill_tree(pid);
+
     Ok(())
 }
 
@@ -640,28 +407,9 @@ fn kill_process(pid: u32) {
             log::error!("Failed to kill PID {}", pid);
         }
     }
-
-    kill_tree(pid);
 }
 
-static ALLOWED_BINARIES: &[&str] = &[
-    // "firefox", // contest browser
-    "chromium",
-    "iicpc-watchdog",
-    "Xorg",
-    "wayland",
-    "systemd",
-    "dbus-daemon",
-    "NetworkManager",
-    "pipewire",
-];
-
-fn is_allowed(proc: &ProcInfo) -> bool {
-    let binary_str = proc.binary.to_string();
-    ALLOWED_BINARIES.iter().any(|allow| binary_str == *allow)
-}
-
-pub fn write_report(report: &ScanReport) -> Result<()> {
+fn write_report(report: &ScanReport) -> Result<()> {
     let ts = Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
     let filename = format!("/tmp/IICPC_SCAN_REPORT_{}.json", ts);
     let json = serde_json::to_string_pretty(report)?;
