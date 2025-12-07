@@ -42,11 +42,6 @@ pub fn start_process_watchdog(browser_pid: u32) {
     thread::spawn(move || {
         log::info!("Process watchdog started");
         focus::main(&allowed_pids);
-
-        // loop {
-        //     focus::main(&allowed_pids);
-        //     thread::sleep(SCAN_INTERVAL);
-        // }
     });
 }
 

@@ -3,7 +3,7 @@ use std::fs;
 use sysinfo::System;
 
 use crate::config::{LOG_DIR, RUNTIME_DIR};
-use crate::logger;
+use crate::{focus, logger};
 
 pub fn run() -> Result<()> {
     log::info!("initializing...");
@@ -21,20 +21,31 @@ fn preflight_checks() -> Result<()> {
     let os = System::name().unwrap_or("Unknown".into());
     let ver = System::os_version().unwrap_or("unk".into());
 
+    if let Err(e) = focus::validate_user_resolution() {
+        return Err(anyhow!("Could not find user other than root: {}", e));
+    }
+
     let kernel_ver =
         System::kernel_version().ok_or_else(|| anyhow!("Failed to read kernel version"))?;
 
     log::info!("Detected OS: {} (version {})", os, ver);
     log::info!("Kernel version: {}", kernel_ver);
-    log::info!(
-        "Session: {}",
-        std::env::var("XDG_SESSION_TYPE").unwrap_or("unknown".into())
-    );
+    log::info!("Session (root): {}", detect_session_type());
 
     ensure_kernel_support(&kernel_ver)?;
     ensure_nft_sni_support()?;
 
     Ok(())
+}
+
+fn detect_session_type() -> &'static str {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        "wayland"
+    } else if std::env::var_os("DISPLAY").is_some() {
+        "x11"
+    } else {
+        "unknown"
+    }
 }
 
 fn ensure_kernel_support(kernel: &str) -> Result<()> {

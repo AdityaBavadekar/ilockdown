@@ -49,16 +49,16 @@ struct ScanArgs {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Creates necessary directories, performs preflight checks
+    /// Creates necessary directories, performs preflight checks, and captures process baseline
     Init,
 
     /// Starts the lockdown daemon
     Start,
 
-    /// Checks if the lockdown is currently active
+    /// Checks if the lockdown is currently active by verifying the lock file
     Status,
 
-    /// Releases the lockdown, restoring normal system operation
+    /// Releases the lockdown, restoring network, audio, and system restrictions
     Unlock,
 
     /// A background heartbeat process that prevents the system from sleeping
@@ -67,19 +67,19 @@ enum Commands {
     /// Performs a one-time forensic scan for blacklisted processes (see help for options)
     Scan(ScanArgs),
 
-    // Launches a locked-down browser instance
+    /// Launches the locked browser instance in isolation to verify kiosk mode settings and user profile creation
     BrowserTest,
 
-    // Runs a proxy server for testing purposes
+    /// Runs the internal proxy server for testing network filtering logic independently
     ProxyTest,
 
-    // Logs blacklisted applications and kills them
+    /// Runs the process watchdog in isolation to test blacklist enforcement
     RestrictAppsTest,
 
-    // Focus monitoring test
+    /// Runs the focus monitoring loop to test window title detection
     FocusMonitor,
 
-    // Audio test
+    /// Tests the audio subsystem lockdown (mute sink/source)
     AudioTest,
 }
 
@@ -108,8 +108,9 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Init => {
-            println!("Initialization complete.");
             focus::init_monitor();
+            init::run()?;
+            println!("Initialization complete.");
         }
         Commands::Status => {
             if !lock::check_lockdown_active() {

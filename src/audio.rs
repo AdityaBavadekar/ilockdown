@@ -2,9 +2,9 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-// TODO: does not work in root
+use crate::config::STATE_FILE;
 
-const STATE_FILE: &str = "/tmp/lockdown_audio_state";
+// TODO: does not work in root
 
 #[derive(Clone, Copy)]
 struct AudioState {

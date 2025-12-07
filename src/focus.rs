@@ -1,4 +1,4 @@
-use crate::config::PROC_BASELINE_FILE;
+use crate::config::{PROC_BASELINE_FILE, SAFE_CHILD_TYPES, SYSTEM_CRITICAL};
 use anyhow::Result;
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -33,14 +33,7 @@ struct ProcessPattern {
     cmdline_patterns: Vec<String>,
 }
 
-const SYSTEM_CRITICAL: &[&str] = &[
-    "systemd", "dbus", "kwin", "plasma", "Xwayland", "Xorg", "sddm", "gdm", "lightdm", "ssh",
-    "login", "init",
-];
-
-const SAFE_CHILD_TYPES: &[&str] = &["bash", "sh", "zsh", "fish", "kitten"];
-
-fn get_user_info() -> (String, String) {
+pub fn get_user_info() -> (String, String) {
     let user = env::var("SUDO_USER")
         .or_else(|_| env::var("USER"))
         .unwrap_or_else(|_| "root".to_string());
@@ -57,6 +50,25 @@ fn get_user_info() -> (String, String) {
     });
 
     (user, uid)
+}
+
+pub fn validate_user_resolution() -> Result<()> {
+    let (user, uid) = get_user_info();
+
+    if user == "root" {
+        return Err(anyhow::anyhow!(
+            "Resolved user is 'root'. This tool must be run via sudo from a normal user account (e.g., 'sudo ./iicpc-lockdown ...')."
+        ));
+    }
+
+    if uid == "0" {
+        return Err(anyhow::anyhow!(
+            "Resolved UID is 0 (root). Cannot determine the actual desktop user."
+        ));
+    }
+
+    info!("User resolution verified: {} (UID: {})", user, uid);
+    Ok(())
 }
 
 fn get_user_processes(uid: &str) -> Vec<Process> {
@@ -419,9 +431,8 @@ fn build_process_tree(processes: &[Process]) -> HashMap<u32, Vec<u32>> {
 }
 
 const ALLOWED_BINARIES: &[&str] = &[
-    "/usr/bin/obs", // TODO: only for when recording demo
-    "/home/adi/Downloads/icpc_obs_linux/obshash",
-    "/usr/bin/obs-ffmpeg-mux",
+    // "/usr/bin/obs", // TODO: only for when recording demo
+    // "/usr/bin/obs-ffmpeg-mux",
 ];
 
 pub fn main(allowed_pids: &Option<Vec<u32>>) {
@@ -450,8 +461,6 @@ pub fn main(allowed_pids: &Option<Vec<u32>>) {
         .as_ref()
         .and_then(|pids| pids.first().copied())
         .unwrap_or(0);
-
-    info!("Firefox started at PID {}", target_browser_pid);
 
     let mut seen_root = false;
     let root_pid = target_browser_pid;

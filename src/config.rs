@@ -255,3 +255,9 @@ pub const INTERPRETERS_AND_COMPILERS: &[&str] = &[
 ];
 pub const SCAN_INTERVAL: Duration = Duration::from_secs(10);
 pub const PROC_BASELINE_FILE: &str = "/run/iicpc-lockdown/procb.json";
+pub const SYSTEM_CRITICAL: &[&str] = &[
+    "systemd", "dbus", "kwin", "plasma", "Xwayland", "Xorg", "sddm", "gdm", "lightdm", "ssh",
+    "login", "init",
+];
+pub const SAFE_CHILD_TYPES: &[&str] = &["bash", "sh", "zsh", "fish", "kitten"];
+pub const STATE_FILE: &str = "/tmp/lockdown_audio_state";

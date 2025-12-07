@@ -65,10 +65,10 @@ pub fn active_log_file() -> PathBuf {
 }
 
 fn log_directory() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".iicpc-lockdown/logs")
+    if nix::unistd::Uid::effective().is_root() {
+        PathBuf::from("/var/log/iicpc-lockdown")
     } else {
-        PathBuf::from("/tmp/iicpc-lockdown/logs")
+        PathBuf::from(std::env::var("HOME").unwrap()).join(".iicpc-lockdown/logs")
     }
 }
 

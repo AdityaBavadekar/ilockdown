@@ -98,16 +98,17 @@ Secure Lockdown Tool for Linux
 Usage: iicpc-lockdown <COMMAND>
 
 Commands:
-  init                Creates necessary directories, performs preflight checks
+  init                Creates necessary directories, performs preflight checks, and captures process baseline
   start               Starts the lockdown daemon
-  status              Checks if the lockdown is currently active
+  status              Checks if the lockdown is currently active by verifying the lock file
   unlock              Releases the lockdown, restoring normal system operation
   keep-alive          A background heartbeat process that prevents the system from sleeping
   scan                Performs a one-time forensic scan for blacklisted processes (see help for options)
-  browser-test        
-  proxy-test          
-  restrict-apps-test  
-  focus-monitor       
+  browser-test        Launches the locked browser instance in isolation to verify kiosk mode settings and user profile creation
+  proxy-test          Runs the internal proxy server for testing network filtering logic independently
+  restrict-apps-test  Runs the process watchdog in isolation to test blacklist enforcement
+  focus-monitor       Runs the focus monitoring loop to test window title detection
+  audio-test          Tests the audio subsystem lockdown (mute sink/source)
   help                Print this message or the help of the given subcommand(s)
 
 Options:
@@ -128,6 +129,10 @@ Initializes the system for the lockdown tool. This command is the "setup" phase 
 2.  **Directory Creation**:
     *   Creates the log directory: `/var/log/iicpc-lockdown/`.
     *   Creates the runtime directory: `/run/iicpc-lockdown/` (used for lock files and PID tracking).
+3.  **Baseline Capture**:
+    *   Captures a snapshot of currently running processes.
+    *   This baseline is used to distinguish between legitimate user processes (like the desktop environment) and potential cheating tools that might be launched later.
+    *   The baseline is saved to a file for use during the lockdown session.
 
 **Usage**:
 ```bash
@@ -138,6 +143,52 @@ sudo ./iicpc-lockdown init
 Activates the full lockdown mode. This is the main entry point for the exam session.
 
 **How it works (The Lockdown Sequence):**
+
+The `start` command orchestrates a complex sequence of security measures to lock down the machine.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI as iicpc-lockdown
+    participant Lock as Lock File
+    participant Firewall as nftables
+    participant Proxy as Local Proxy
+    participant Browser as Locked Browser
+    participant Watchdog as Process Watchdog
+
+    User->>CLI: start
+    CLI->>Lock: Acquire Exclusive Lock
+    alt Lock Failed
+        CLI-->>User: Error: Already Running
+    end
+    
+    CLI->>CLI: Pre-flight Checks
+    CLI->>Firewall: Apply "Drop All" Ruleset
+    CLI->>Firewall: Allow codeforces.com & DNS
+    CLI->>Firewall: Sinkhole /etc/hosts (LLMs)
+    
+    CLI->>Proxy: Start on 127.0.0.1:8080
+    CLI->>Proxy: Wait for Readiness
+    
+    CLI->>Browser: Launch (Kiosk Mode, No DevTools)
+    CLI->>Browser: Move to Cgroup (No GPU, Mem Limit)
+    
+    par Monitoring
+        CLI->>Watchdog: Start Scanning /proc
+        Watchdog->>Watchdog: Kill Blacklisted Apps
+    and Network Watchdog
+        CLI->>CLI: Monitor New Interfaces
+    end
+    
+    Note over User, Watchdog: Exam Session Active
+    
+    User->>CLI: Ctrl+C
+    CLI->>Browser: Terminate
+    CLI->>Firewall: Restore Ruleset
+    CLI->>Lock: Release Lock
+    CLI-->>User: Lockdown Lifted
+```
+
 1.  **Lock Acquisition**: Acquires a file lock (`/run/iicpc-lockdown/active.lock`) to ensure only one instance runs.
 2.  **Baseline Snapshot**: Records the current system state (network interfaces, running processes) to detect changes later.
 3.  **Network Lockdown**:
@@ -160,14 +211,14 @@ Activates the full lockdown mode. This is the main entry point for the exam sess
 
 **Usage**:
 ```bash
-./iicpc-lockdown start
+sudo ./iicpc-lockdown start
 ```
 
 #### `status`
 Checks and displays the current status of the application.
 
 **How it works:**
-*   **Lock Check**: Attempts to acquire a shared lock on `/run/iicpc-lockdown/active.lock`. If the file is already exclusively locked by the `start` daemon, it reports "Lockdown is currently active."
+*   **Lock Check**: Attempts to acquire an **exclusive** lock on `/run/iicpc-lockdown/active.lock`. If the file is already exclusively locked by the `start` daemon, the acquisition fails, confirming that "Lockdown is currently active."
 *   **Output**: Simple text status ("Locked" or "Unlocked").
 
 **Usage**:
@@ -184,7 +235,8 @@ Performs an emergency exit and restores the system to its pre-lockdown state.
 3.  **Service Restoration**: Unmask and restarts any systemd services that were automatically blocked by the watchdog (e.g., if a student tried to start a VPN service).
 4.  **Hosts Restoration**: Restores the original `/etc/hosts` file from the backup created at start.
 5.  **Firewall Cleanup**: Deletes the `iicpc_lock` table from `nftables`, effectively removing all network restrictions.
-6.  **Connectivity Verification**: Performs a final check to ensure `google.com` is reachable again, confirming the system is back to normal.
+6.  **Audio Restoration**: Unmutes the audio sink and source (microphone) to restore normal audio function.
+7.  **Connectivity Verification**: Performs a final check to ensure `google.com` is reachable again, confirming the system is back to normal.
 
 **Usage**:
 ```bash
@@ -264,6 +316,37 @@ Runs the focus monitoring loop to test window title detection on X11/Wayland.
 **Usage**:
 ```bash
 ./iicpc-lockdown focus-monitor
+```
+
+#### `restrict-apps-test`
+Runs the process watchdog in isolation to test blacklist enforcement.
+
+**How it works:**
+*   Starts the `watchdog` module in a loop.
+*   **Monitoring**: Continuously scans `/proc` for blacklisted processes (e.g., `code`, `python`, `discord`).
+*   **Enforcement**: If a blacklisted process is found, it is immediately killed.
+*   **Purpose**: Verifies that the blacklist logic is correctly identifying and terminating forbidden applications without needing to start the full lockdown.
+
+**Usage**:
+```bash
+sudo ./iicpc-lockdown restrict-apps-test
+```
+
+#### `audio-test`
+Tests the audio subsystem lockdown.
+
+**How it works:**
+*   **Muting**: Attempts to mute both the default audio sink (output) and source (microphone).
+*   **Backends**:
+    *   `wpctl` (WirePlumber/PipeWire): Preferred modern backend.
+    *   `amixer` (ALSA): Fallback for older systems.
+*   **Loop**: Continuously enforces the mute state every second to prevent users from unmuting.
+*   **Restoration**: On exit (Ctrl+C), it restores the previous volume state.
+*   **Purpose**: Verifies that the tool can successfully silence the machine to prevent communication via audio.
+
+**Usage**:
+```bash
+./iicpc-lockdown audio-test
 ```
 
 ## Project Structure: What Does What
